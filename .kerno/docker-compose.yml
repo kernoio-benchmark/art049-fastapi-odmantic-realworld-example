@@ -1,0 +1,122 @@
+services:
+  mongodb:
+    image: mongo:8.0
+    pull_policy: missing
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=test_user
+      - MONGO_INITDB_ROOT_PASSWORD=test_password
+      - MONGO_INITDB_DATABASE=test_db
+    tmpfs:
+      - /data/db
+    ports:
+      - "27017"
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --username $$MONGO_INITDB_ROOT_USERNAME --password $$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval \"db.adminCommand({ ping: 1 })\" --quiet || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    labels:
+      - external-url=mongodb://localhost:{{PORT}}/test_db?user=test_user&password=test_password
+
+  sut:
+    build:
+      context: ${BUILD_CONTEXT}
+      dockerfile_inline: |
+        # Multi-stage build for Python FastAPI application with Poetry
+
+        # Builder stage - Install dependencies
+        FROM python:3.11-slim as builder
+
+        # Set environment variables for Poetry
+        ENV PYTHONUNBUFFERED=1 \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PIP_NO_CACHE_DIR=1 \
+            PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            POETRY_VERSION=1.7.1 \
+            POETRY_HOME="/opt/poetry" \
+            POETRY_NO_INTERACTION=1 \
+            POETRY_VIRTUALENVS_IN_PROJECT=true \
+            POETRY_VIRTUALENVS_CREATE=true
+
+        # Install system dependencies and Poetry
+        RUN apt-get update && \
+            apt-get install -y --no-install-recommends \
+                curl \
+                build-essential \
+                libffi-dev && \
+            curl -sSL https://install.python-poetry.org | python3 - && \
+            apt-get clean && \
+            rm -rf /var/lib/apt/lists/*
+
+        # Add Poetry to PATH
+        ENV PATH="/opt/poetry/bin:$$PATH"
+
+        # Set working directory
+        WORKDIR /app
+
+        # Copy dependency files
+        COPY pyproject.toml poetry.lock* ./
+
+        # Install dependencies (production only, no dev dependencies)
+        RUN poetry install --no-root --only main --no-directory
+
+        # Runtime stage - Minimal production image
+        FROM python:3.11-slim as runtime
+
+        # Set environment variables with defaults from documentation
+        ENV PYTHONUNBUFFERED=1 \
+            PYTHONDONTWRITEBYTECODE=1 \
+            PATH="/app/.venv/bin:$$PATH" \
+            PYTHONPATH="/app" \
+            SECRET_KEY="09d25e094faa6ca2556c818166b7a9563b93f7099f6f0f4caa6cf63b88e8d3e7" \
+            ALGORITHM="HS256" \
+            ACCESS_TOKEN_EXPIRE_MINUTES="30"
+
+        # Install minimal runtime dependencies
+        RUN apt-get update && \
+            apt-get install -y --no-install-recommends \
+                libffi8 \
+                libssl3 && \
+            apt-get clean && \
+            rm -rf /var/lib/apt/lists/*
+
+        # Create non-root user for security
+        RUN useradd -m -u 1000 appuser && \
+            mkdir -p /app && \
+            chown -R appuser:appuser /app
+
+        # Set working directory
+        WORKDIR /app
+
+        # Copy virtual environment from builder stage
+        COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
+
+        # Copy application source code
+        COPY --chown=appuser:appuser . .
+
+        # Switch to non-root user
+        USER appuser
+
+        # Expose port for FastAPI/Uvicorn
+        EXPOSE 8000
+
+        # Run the application with uvicorn
+        # Module path should be adjusted based on actual project structure
+        # Default assumes src/main.py with app instance as per documentation
+        CMD ["uvicorn", "api:app", "--app-dir", "./src/", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "8000"
+    labels:
+      - jwt-signing-config=HS256:this_is_a_secret_meeting_all_requirements_of_any_hs_algorithms
